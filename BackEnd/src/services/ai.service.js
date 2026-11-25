@@ -92,6 +92,111 @@ const model = genAI.getGenerativeModel({
 });
 
 // Generate review content
+const SEVERITY_WEIGHTS = {
+    Critical: 20,
+    Warning: 10,
+    Informational: 3,
+};
+
+// In-memory chat session store: sessionId -> Gemini chat instance
+
+// Dedicated model for security audits - JSON output mode, isolated from chat model
+const securityModel = genAI.getGenerativeModel({
+    model: "gemini-3.5-flash-lite",
+    generationConfig: {
+        responseMimeType: "application/json",
+    },
+    systemInstruction: `You are a security analysis engine. Given source code, identify security vulnerabilities and return ONLY a valid JSON object — no commentary, no markdown, no extra text.
+
+The JSON object must conform to this exact schema:
+
+{
+    "score": <integer 0-100 where 100 means no vulnerabilities and 0 means critically dangerous>,
+    "summary": "<one sentence describing the overall security posture>",
+    "findings": [
+        {
+            "id": "<unique string, e.g. VULN-001>",
+            "severity": "<one of: Critical | Warning | Informational>",
+            "type": "<vulnerability category, e.g. SQL Injection | XSS | Hardcoded Credential>",
+            "title": "<short title, max 60 chars>",
+            "description": "<detailed explanation of the vulnerability and why it is dangerous>",
+            "lineStart": <1-based integer line number where the vulnerability starts, or null if not locatable>,
+            "lineEnd": <1-based integer line number where the vulnerability ends, or null>,
+            "codeSnippet": "<the exact vulnerable code fragment, max 120 chars>",
+            "remediation": "<concrete fix or recommendation>"
+        }
+    ]
+}
+
+Severity rules:
+- Critical: exploitable remotely, data loss/exfiltration risk, authentication bypass, code execution
+- Warning: bad practice that could become exploitable, missing validation, insecure defaults
+- Informational: code smells, overly permissive settings, hardcoded non-secret values
+
+Score formula: start at 100, subtract 20 per Critical, 10 per Warning, 3 per Informational. Minimum 0.
+If no vulnerabilities are found, return findings: [] and score: 100.
+Always return exactly one top-level JSON object matching this schema.`,
+});
+
+function normalizeFinding(finding, index) {
+    const validSeverities = Object.keys(SEVERITY_WEIGHTS);
+    const severity = validSeverities.includes(finding?.severity)
+        ? finding.severity
+        : "Informational";
+
+    return {
+        id: finding?.id || `VULN-${String(index + 1).padStart(3, "0")}`,
+        severity,
+        type: finding?.type || "General",
+        title: String(finding?.title || "Potential security issue").slice(0, 60),
+        description: finding?.description || "",
+        lineStart:
+            typeof finding?.lineStart === "number" ? finding.lineStart : null,
+        lineEnd: typeof finding?.lineEnd === "number" ? finding.lineEnd : null,
+        codeSnippet: finding?.codeSnippet
+            ? String(finding.codeSnippet).slice(0, 120)
+            : "",
+        remediation: finding?.remediation || "",
+    };
+}
+
+// Stateless security audit — returns { score, summary, findings }
+export async function runSecurityAudit(code) {
+    try {
+        if (typeof code !== "string" || !code.trim()) {
+            throw new Error("Code is required.");
+        }
+
+        const prompt = `Analyze the following code for security vulnerabilities:\n\n${code}`;
+        const result = await securityModel.generateContent(prompt);
+
+        if (!result?.response) {
+            throw new Error("Empty response from Gemini API.");
+        }
+
+        const raw = result.response.text();
+        const parsed = JSON.parse(raw);
+
+        if (!Array.isArray(parsed.findings) || typeof parsed.score !== "number") {
+            throw new Error("Malformed security audit response schema.");
+        }
+
+        const clampedScore = Math.max(0, Math.min(100, Math.round(parsed.score)));
+        const findings = parsed.findings.map(normalizeFinding);
+
+        return {
+            score: clampedScore,
+            summary:
+                typeof parsed.summary === "string" && parsed.summary.trim()
+                    ? parsed.summary.trim()
+                    : "Security audit completed.",
+            findings,
+        };
+    } catch (error) {
+        console.error("Error in security audit:", error.message);
+        throw error;
+    }
+}
 const chatSessions= new Map()
 
 function getOrCreateChatSession(sessionId){
@@ -121,6 +226,7 @@ export async function sendChatMessages(sessionId,message) {
   return "failed to proceed message. please try again later.";
 }
 }
+
 
 export default async function generateContent(prompt, history=[]) {
   try {
